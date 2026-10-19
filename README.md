@@ -23,7 +23,7 @@ YABS、bench.sh、融合怪很快很好用，但它们测的是"快不快"，不
 ## 快速开始
 
 ```bash
-git clone https://github.com/holtwood/cloud-bench.git
+git clone https://github.com/holtwood-projects/cloud-bench.git
 cd cloud-bench
 
 # 1. 先在 ~/.ssh/config 里配好目标机器的别名（并确保免密登录可用）
