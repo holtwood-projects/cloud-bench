@@ -1,6 +1,6 @@
 # HANDOFF —— 交接文档
 
-> 最后更新：2026-09-14
+> 最后更新：2026-11-06
 > 写给：接手这个项目的人（包括几周后已经忘了细节的我自己）
 
 ---
@@ -10,7 +10,9 @@
 **这是什么**：云服务器性能评测工具。在服务器上跑一套固定流程，把结果提交到对比站点。
 
 **现在什么状态**：工具可用（脚本 + 上报 + 报告），站点可用（本地跑通，未公网部署），
-已有 6 台真实机器的数据集。
+已有 6 台真实机器的数据集。2026-11 新增了「多次采样与批次聚合」的离线实现：
+`run --repeat N`、`status/collect/report/submit/summarize --batch`、
+`samples` 的 median/p95/min/max/n 与阶段状态聚合；尚未在真实主机跑长批次验收。
 
 **如果你只做一件事**：读第四节「关键设计决策」——那里写明了**为什么是这样**，
 避免你（或我）把好不容易试出来的设计又改回去。
@@ -42,7 +44,7 @@
 ### 3.1 使用者视角（公开流程）
 
 ```bash
-git clone https://github.com/holtwood/cloud-bench.git
+git clone https://github.com/holtwood-projects/cloud-bench.git
 cd cloud-bench
 
 # 1. 配好 ssh 免密登录，然后在 ~/.ssh/config 里给目标机器起个别名
@@ -50,20 +52,27 @@ cd cloud-bench
 cp results/hosts.tsv.example results/hosts.tsv
 vim results/hosts.tsv
 
-# 3. 测（默认 quick 档约 16 分钟；远端 tmux 执行，SSH 断连不中断）
+# 3. 测（默认 quick 档按历史推算约 16 分钟，待真机验收；远端 tmux 或 setsid+nohup）
 ./scripts/cloud-benchmark.sh run --name mycloud-2c2g-01
+# 想降低波动：顺序跑 3 个独立 run
+./scripts/cloud-benchmark.sh run --name mycloud-2c2g-01 --repeat 3
 
-# 4. 看进度 / 回收产物
+# 4. 看进度 / 回收产物（默认最新 run；--run ID 可指定旧运行）
 ./scripts/cloud-benchmark.sh status  --name mycloud-2c2g-01
 ./scripts/cloud-benchmark.sh collect --name mycloud-2c2g-01
+# 批次模式：status/collect/report 都支持 --batch <ID>
+./scripts/cloud-benchmark.sh status  --name mycloud-2c2g-01 --batch <batch_id>
+./scripts/cloud-benchmark.sh collect --name mycloud-2c2g-01 --batch <batch_id>
 
 # 5. 出「人话报告」
 ./scripts/cloud-benchmark.sh report  --name mycloud-2c2g-01
+./scripts/cloud-benchmark.sh report  --name mycloud-2c2g-01 --batch <batch_id>
 
-# 6. 提交到站点（先 dry-run 看要传什么）
+# 6. 提交到站点（先 dry-run 看要传什么；批次同样支持）
 export BENCH_API_KEY=xxx
 ./scripts/cloud-benchmark.sh submit --name mycloud-2c2g-01 --api https://站点 --dry-run
 ./scripts/cloud-benchmark.sh submit --name mycloud-2c2g-01 --api https://站点
+./scripts/cloud-benchmark.sh submit --name mycloud-2c2g-01 --batch <batch_id> --api https://站点 --dry-run
 ```
 
 ### 3.2 作者视角（工具在公开仓库、数据在私有工作区）
@@ -93,7 +102,7 @@ BENCH_API_KEY=xxx ./cloud-bench -addr :8090
 
 ## 四、关键设计决策（含理由，别轻易推翻）
 
-### 4.1 为什么默认档只要 16 分钟
+### 4.1 为什么默认档的目标是 16 分钟
 
 实测全量 **2 小时 28 分**，其中 PTS 占 **1:49:20（74%）**，
 而 PTS 里的 `build-linux-kernel` 单项就 **87 分钟（占全量 59%）**。
@@ -102,12 +111,13 @@ BENCH_API_KEY=xxx ./cloud-bench -addr :8090
 
 | 档位 | 阶段 | 耗时 |
 |---|---|---|
-| `quick`（默认） | env deps fio sysbench stress(5m) net | ~16 分钟 |
+| `quick`（默认） | env deps fio sysbench stress(5m) net | ~16 分钟（推算，待验收） |
 | `standard` | quick + yabs + pts(7zip, redis) | ~40 分钟 |
 | `full` | 全部八阶段 | ~2.5 小时 |
 
 **关键：quick 不损失任何差异化指标**——磁盘 p99（fio）、超售 %steal（stress）、
 物理核识别（env）全在其中。砍掉的恰恰是 YABS 也有的通用跑分。
+`deps` 现在也按阶段裁剪：quick 不再安装 PTS 和内核编译依赖，避免默认档被 apt/git 拖慢。
 
 > ⚠️ 如果哪天想「把内核编译加回默认」，请先想清楚：这会让 90% 的用户跑 2.5 小时，
 > 而他们根本不需要这个指标。
@@ -140,6 +150,32 @@ fio 测试文件大小按磁盘余量自适应（1G/2G/4G），六台实测中�
 ### 4.6 为什么 `tested_at` 从产物时间戳取，而不是取提交当天
 
 测试与提交可能相隔很久。取产物时间戳才是「这台机器什么时候测的」。
+
+### 4.7 为什么每次运行要独立 `run_id`
+
+旧实现所有运行共用一个 `out/`，重跑会覆盖 `pts.log`、旧 JSON 和 `metrics.tsv`；
+一旦某阶段失败，旧指标仍可能被汇总成当前结果。现在每次 `run` 分配
+`runs/<run_id>/out`，并写 `run-status.tsv` / `stage-status.tsv`；`collect` 拉到
+`results/<name>/<run_id>/`，用 `LATEST` 指向远端最近一次（回收旧 run 不会让它倒退）。
+`stage-status.tsv` 支持 `ok / partial / failed`：PTS 只跑出部分请求测试时是 partial，
+结果 JSON 里同步给出 `stages_partial`。collect 在 `starting / running` 时默认拒绝，
+`--force` 才回收半份数据。旧版扁平目录仍可读取。
+PTS 阶段会把本次新建的结果目录写入 `pts-result-names.txt`（保留单值文件兼容旧逻辑），
+collect 备份全部对应目录；没有该文件时，只有旧版扁平目录才回退到 `test-results`
+最新目录，避免旧 `composite.xml` 错配。
+
+### 4.8 为什么 `--repeat` 顺序执行、聚合取中位数
+
+单次 fio/网络成绩会受邻居和公网路由影响；`--repeat N` 在远端顺序生成 N 个独立 run，
+**不并发**，避免多份压测互相污染。批次清单在
+`~/cloud-benchmark/batches/<id>/batch.tsv`，回收后复制到
+`results/<name>/batches/<id>.tsv`。`N=1` 仍走旧的单 run 路径，避免改变已有脚本行为。
+
+聚合时 `metrics` 取各 run 的中位数，保持旧消费方兼容；`samples` 额外保留
+median/p95/min/max/n。p95 用 nearest-rank（小样本不插值），缺失指标不补 0。
+阶段状态按 run 聚合：全 ok → ok，全 failed → failed，其余 partial。
+样本不足、部分 run 失败、阶段不完整都会在报告和 `to-result.py` 的 stderr 显式提示。
+`schema_version` 保持 2；`batch` / `samples` 是可选字段，私有服务端兼容性尚未验证。
 
 ---
 
@@ -175,6 +211,8 @@ YABS 内置提交协议（`yabs.sh -s <url>`），是英文圈的事实标准入
 
 ### 待办（按性价比排序）
 
+- [ ] **真实主机验收 `--repeat` 批次**（至少 2 次 quick run，验证长批次、--at 和 collect 状态）
+- [ ] **确认私有服务端接受/忽略 `batch` / `samples` 字段**（schema_version 仍为 2）
 - [ ] **兼容 YABS 提交协议**（`POST /api/submit/yabs`）——半天工作量，直接接入现成社区
 - [ ] **站点公网部署**（部署步骤见私有仓库的 `docs/deploy.md`）
 - [ ] **LICENSE 选择**（目前无 license，法律上等于「保留所有权利」）
@@ -186,8 +224,10 @@ YABS 内置提交协议（`yabs.sh -s <url>`），是英文圈的事实标准入
 | 问题 | 说明 |
 |---|---|
 | 火山云 region | YABS 的 IP 库识别为「香港九龙」，作者清单里写「广州/北京」——以哪个为准 |
-| `fio_file_size_gb` 的影响 | 已知口径不一致，但「小文件是否显著抬高 IOPS」未做实验验证 |
+| `fio_file_size_gb` 的影响 | 已知口径不一致；现在同时记录单 job 大小与 `fio_total_size_gb`，但「小文件是否显著抬高 IOPS」仍未做实验验证 |
 | quick 档实测耗时 | 16 分钟是**按历史日志推算**的，尚未在真机上完整跑过一遍验证 |
+| 批次真实耗时 | `--repeat N` 理论约等于单次 ×N；长批次、`--at` 跨日等待和真实 PTS 尚未验收 |
+| 服务端 schema | `batch` / `samples` 为可选字段，但私有服务端是否会拒绝未知字段仍未验证 |
 
 ---
 
@@ -213,6 +253,11 @@ fio / sysbench / iperf3 / stress-ng / sysstat（脚本用 apt 装，已处理非
 
 **平台实测范围**：脚本在 Debian/Ubuntu 系上验证过（国内多家云商的轻量/CVM 实例）。
 其他发行版未实测——`docs/pitfalls.md` 里的坑大多与环境相关，换环境请重读。
+
+**离线验证现状（2026-11-06）**：29 个 unittest 全绿，包含 mock
+`run --repeat 2 → status → collect → report/submit --dry-run/summarize` 端到端链路；
+`bash -n`、`shellcheck -S warning`、`py_compile`、`git diff --check` 均通过。
+这只证明脚本/解析器在 mock 环境可跑，**不等于真机批次或站点验收**。
 
 ---
 

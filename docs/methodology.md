@@ -2,10 +2,10 @@
 
 > 本站每一个数字的来源、参数与口径。所有命令与参数公开，任何人都能据此复现。
 >
-> 脚本：`cloud-benchmark.sh`（8 阶段采集 + 汇总）。**参数以脚本为准**，本文档说明设计意图与读法。
+> 脚本：`scripts/cloud-benchmark.sh`（8 阶段采集 + 汇总）。**参数以脚本为准**，本文档说明设计意图与读法。
 >
-> ⚠️ 该脚本**尚未随本仓库发布**（目前仍在作者私有仓库中）。本文档因此先行公开全部参数与口径，
-> 可据此手工复现；脚本发布后会在此补上仓库内链接。
+> 2026-11 起每次运行有独立 `run_id`，产物在 `results/<name>/<run_id>/`；运行状态见
+> `run-status.tsv`，阶段状态见 `stage-status.tsv`。
 
 ---
 
@@ -18,7 +18,7 @@ YABS、bench.sh、融合怪等主流脚本很快很好用，但它们的定位�
 |---|---|---|
 | 只有平均 IOPS，无长尾延迟 | 平均 26000 IOPS 看着漂亮，但 p99 可能是 952ms——数据库/容器的卡顿就是这么来的 | fio 记录 **p99 / p99.9** 延迟 |
 | 几乎不做超售检测 | 邻居跑满时你的机器被抢 CPU，跑分那几分钟看不出来 | stress-ng 满载 20 分钟 + mpstat 持续记录 **%steal** |
-| 只看标称核数 | 「2 核」可能是 1 物理核 × 2 超线程，「4 核」可能是 2 核 × 2 线程 | 从 `lscpu` 拆出 **物理核/线程**，并用多核扩展比交叉验证 |
+| 只看标称核数 | 「2 核」可能是 1 物理核 × 2 超线程，「4 核」可能是 2 核 × 2 线程 | 从 `lscpu` 拆出 **物理核/线程**；多核扩展比作为人工旁证 |
 | 不检测指令集 | 屏蔽 AVX 的机器跑不了某些工作负载，甚至直接 SIGILL | 检查 AVX/AVX-512 |
 | 无原始数据 | 只有截图，无法复核、无法横向对比 | 原始产物全量保留 + 统一 schema 入库 |
 
@@ -33,8 +33,9 @@ YABS、bench.sh、融合怪等主流脚本很快很好用，但它们的定位�
 六台国内轻量/CVM 主机（2026-09 实测）。每台的元信息都记录在数据集里：
 
 - **规格**：2C2G / 4C8G / 4C4G
-- **物理核 vs 线程**：由 `lscpu` 的 `Thread(s) per core` × `Core(s) per socket` × `Socket(s)` 推导，
-  并**只在结果满足「单核不高于多核」「扩展比合理」时才采信**（见第四节）
+- **物理核 vs 线程**：由 `lscpu` 的 `Thread(s) per core` × `Core(s) per socket` × `Socket(s)` 推导；
+  `physical_cores_source` 会标注是 `lscpu` 还是回退到 vCPU。多核扩展比目前作为人工旁证，
+  不自动改写拓扑结论
 - **业务负载**：数据集 `role` 字段记录测试时跑了多少容器（生产机 vs 空机）——**这是重要的对比前提**
 - **内核版本**：数据集 `kernel` 字段。版本差异实测可影响 9~23% 的成绩，跨机对比必须看这栏
 
@@ -47,10 +48,51 @@ YABS、bench.sh、融合怪等主流脚本很快很好用，但它们的定位�
 
 ## 三、八个阶段
 
-每阶段独立日志，失败不阻塞后续阶段（记入 `failed-stages.txt`）；重复执行会覆盖该阶段产物且不产生重复指标。
-全部长任务在远端 `tmux` 中执行，SSH 断连不中断。
+每阶段独立日志，失败不阻塞后续阶段；失败写入 `failed-stages.txt`，部分完成写入
+`partial-stages.txt`，由 `remote_exec` 汇总为 `stage-status.tsv` 里的
+`ok / partial / failed`。最终 `run-status.tsv` 为 `ok / partial / failed`；
+只有全部阶段完全成功才会写 `DONE`。
 
-### 先看档位：为什么默认只要 16 分钟
+每次 `run` 生成独立 `run_id`，远端在 `~/cloud-benchmark/runs/<run_id>/out`，本地回收后在
+`results/<name>/<run_id>/`，`LATEST` 指向远端最近一次 run（回收旧 run 不会让它回退）；
+旧版扁平目录仍可读取。`collect` 在任务处于 `starting` / `running` 时默认拒绝，
+需要 `--force` 才回收半份数据。
+全部长任务在远端 `tmux`（无 tmux 时回退 `setsid + nohup`）中执行，SSH 断连不中断。PTS 阶段会把本次新建的结果目录名写入
+`pts-result-names.txt`（可能多个；同时保留单值的 `pts-result-name.txt` 兼容旧逻辑），
+`collect` 只备份这些目录，避免把上一次 run 的 `composite.xml` 错配到当前结果；
+只有旧版扁平目录（无 run_id）才会回退到 `test-results` 下最新的目录。
+
+#### 多次采样与批次聚合（2026-11）
+
+单次 fio/网络成绩会受宿主机邻居、公网路由和盘的瞬时状态影响。`--repeat N` 在同一台机器上
+顺序执行 N 个独立 run，而不是把同一批原始样本重复计数：
+
+- 批次 ID 形如 `20261106T000000Z-abc123`；run ID 为 `<batch_id>-r01`、`-r02`……
+- 远端清单：`~/cloud-benchmark/batches/<batch_id>/batch.tsv`
+- 本地清单：`results/<name>/batches/<batch_id>.tsv`（`collect --batch` 时写入）
+- 每个 run 仍有自己的 `run-status.tsv` / `stage-status.tsv` / 原始产物
+- `N=1` 完全走旧的单 run 路径，不生成批次
+
+聚合口径：
+
+| 字段 | 口径 |
+|---|---|
+| `metrics` | 每个指标取各 run 的**中位数**，保持旧消费方只读该字段即可 |
+| `samples.<metric>.median` | 中位数 |
+| `samples.<metric>.p95` | **nearest-rank**：小样本不插值，n=2/3 时 p95 等于最大值 |
+| `samples.<metric>.min/max` | 实际观测到的最小/最大值 |
+| `samples.<metric>.n` | 该指标实际参与聚合的 run 数，缺失值不补 0 |
+| `batch.status` | 全部 run `ok` 且全部阶段 `ok` → `ok`；全部失败/缺失 → `failed`；其余 → `partial` |
+| `batch.stages` | 阶段状态按 run 聚合：全 `ok` → `ok`，全失败/缺失 → `failed`，其余 → `partial` |
+
+`batch.runs` 保留每个 run 的 `status`、`stages`、起止时间和是否已回收；`missing_run_ids`
+列出本地缺失的样本。样本不足、部分 run 失败、阶段不完整都不会被静默补成完整结果。
+`to-result.py`、`report` 和 `summarize` 都使用同一套聚合口径。
+
+> 这批批次实现目前只通过离线 mock 流程验证；真实主机上的长批次、`--at` 跨日等待、
+> 真实 PTS 和私有服务端对 `batch/samples` 字段的兼容性**尚未验收**。
+
+### 先看档位：为什么默认目标是 16 分钟
 
 实测全量耗时 **约 2 小时 28 分**，但分布极不均匀：
 
@@ -67,12 +109,15 @@ YABS、bench.sh、融合怪等主流脚本很快很好用，但它们的定位�
 
 | 档位 | 阶段 | 耗时 |
 |---|---|---|
-| `quick`（默认） | env, deps, fio, sysbench, stress(5m), net | ~16 分钟 |
+| `quick`（默认） | env, deps, fio, sysbench, stress(5m), net | ~16 分钟（推算，待真机验收） |
 | `standard` | quick + yabs + pts(7-Zip, redis) | ~40 分钟 |
 | `full` | 全部八阶段（含内核编译） | ~2.5 小时 |
 
 **关键：quick 档不损失任何差异化指标**——磁盘 p99（fio）、超售 %steal（stress）、
 物理核识别（env）全在其中。被砍掉的是与 YABS 重叠的通用跑分。
+
+`deps` 也按阶段裁剪：quick 只装 fio/sysbench/iperf3/stress-ng/sysstat 等基础工具，
+不安装 PTS、PHP 扩展和内核编译依赖；standard/full 才按需安装。
 
 
 
@@ -185,11 +230,14 @@ Ookla Speedtest（就近节点）+ 跨机 iperf3 互测（`-P 8` 双向）。
    余量 < 20G → 1G×4，< 40G → 2G×4，否则 4G×4。
    六台实测中火山云是 1G×4（余量仅 8G）、腾讯云04 是 4G×4、其余为 2G×4。
    `--direct=1` 已排除页缓存影响，小文件仍可能少覆盖盘的物理区域，
-   **横向对比 IOPS 时请把这一点记在心里**。测试文件大小记在 `fio_file_size_gb` 字段。
+   **横向对比 IOPS 时请把这一点记在心里**。`fio_file_size_gb` 是单 job 大小，
+   `fio_total_size_gb` 是 `numjobs × size` 的总量，两者都会记录。
 3. **业务负载不同**（`role` 字段）——生产机跑着 7~20 个容器，空机（如 04）成绩会更"干净"。
 4. **测试时段**——不同时段的宿主机负载不同；本站统一取低峰期，但无法保证完全一致。
-5. **单次采样**——每项测试跑一次（fio 内部为 60s 时基测试）。云盘性能存在波动，
-   个位数百分比差异不必过度解读，量级差异才是结论。
+5. **采样次数**——单次 `run` 仍是每项测试跑一次（fio 内部为 60s 时基测试）。
+   云盘性能存在波动，个位数百分比差异不必过度解读，量级差异才是结论。
+   需要判断稳定性时用 `--repeat 3`（或更多）并比较 `samples` 的 p95/范围；
+   `--repeat` 是顺序重复独立 run，不是把同一次 run 的原始样本拆开重算。
 
    > **实测验证**（2026-09-14，同一台机器隔日重测，间隔约 22 小时）：
    >
@@ -219,3 +267,16 @@ Ookla Speedtest（就近节点）+ 跨机 iperf3 互测（`-P 8` 双向）。
 - **不做"推荐榜"**。本站只提供数据，不接厂商、不给"最值得买"的结论。
 - **物理核识别依赖 `lscpu` 的自报**。云厂商若在虚拟化层伪造拓扑，本站无法识破，
   但多核扩展比可以作为旁证（两者矛盾时以扩展比为准）。
+
+---
+
+## 结果 JSON 的完整度字段
+
+`to-result.py` 生成的结果携带 `run.profile`（档位来源）、`method_version`、
+`steal_samples`（mpstat 有效样本数）与 `stages_partial`（跑了但产物不完整）。
+站点据此区分三种状态：本档位不测、应测但没拿到、实测为 0；
+`%steal` 只有在 `steal_samples > 0` 时才把 0% 当作有效结论。
+
+`schema_version` 仍为 `2`。单 run 结果不新增必填字段；批次结果额外带可选的
+`batch`（批次 ID、状态、每个 run 的状态、缺失 run）与 `samples`（各指标分布）。
+旧消费方可以忽略这两个字段，继续只读 `metrics`（批次时为中位数）。

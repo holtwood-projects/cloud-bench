@@ -1,0 +1,24 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: Bash syntax
+        run: bash -n scripts/cloud-benchmark.sh
+      - name: Shellcheck
+        run: shellcheck -S warning scripts/cloud-benchmark.sh
+      - name: Python syntax
+        run: python3 -m py_compile scripts/*.py
+      - name: Python tests
+        run: python3 -m unittest discover -s tests -v

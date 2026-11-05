@@ -11,3 +11,8 @@
 
 # 构建产物（本仓库不再含 Go 代码，但保留规则防误入）
 /cloud-bench
+
+# Python 测试缓存
+__pycache__/
+*.py[cod]
+.pytest_cache/
